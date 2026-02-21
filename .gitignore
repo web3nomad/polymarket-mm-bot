@@ -30,3 +30,4 @@ htmlcov/
 
 # Local data
 data/*.sqlite3
+settlement.jsonl

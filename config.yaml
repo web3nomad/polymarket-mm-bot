@@ -1,0 +1,16 @@
+gamma_url: "https://gamma-api.polymarket.com/markets"
+run_interval_sec: 2
+top_n: 5
+min_liquidity: 1000
+min_spread: 0.02
+order_size: 10
+order_edge: 0.005
+settlement_file: "settlement.jsonl"
+request_timeout_sec: 8
+fetch_limit: 200
+
+risk:
+  initial_equity: 1000
+  max_order_notional: 20
+  max_market_exposure: 100
+  daily_loss_limit: 50
