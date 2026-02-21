@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ class Market:
     best_ask: float
     liquidity: float
     end_time: str | None
+    token_id: str | None
 
 
 @dataclass
@@ -32,6 +34,7 @@ class OrderIntent:
     side: str
     price: float
     size: float
+    token_id: str | None
 
 
 @dataclass
@@ -42,6 +45,7 @@ class Position:
 
 
 DEFAULT_CONFIG = {
+    "mode": "paper",
     "gamma_url": "https://gamma-api.polymarket.com/markets",
     "run_interval_sec": 2.0,
     "top_n": 5,
@@ -54,6 +58,14 @@ DEFAULT_CONFIG = {
         "max_order_notional": 20.0,
         "max_market_exposure": 100.0,
         "daily_loss_limit": 50.0,
+    },
+    "live": {
+        "host": "https://clob.polymarket.com",
+        "chain_id": 137,
+        "signature_type": 1,
+        "private_key_env": "POLYMARKET_PRIVATE_KEY",
+        "funder_env": "POLYMARKET_FUNDER",
+        "order_type": "FOK",
     },
     "settlement_file": "settlement.jsonl",
     "request_timeout_sec": 8,
@@ -151,6 +163,8 @@ def load_config(config_path: Path) -> dict[str, Any]:
         else:
             config[k] = v
     return config
+
+
 def write_event(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"ts": utc_now_iso(), **payload}
@@ -165,6 +179,29 @@ def _to_float(val: Any) -> float | None:
         return float(val)
     except (TypeError, ValueError):
         return None
+
+
+def _extract_token_id(raw: dict[str, Any]) -> str | None:
+    direct = raw.get("token_id") or raw.get("tokenId")
+    if isinstance(direct, str) and direct:
+        return direct
+
+    tokens = raw.get("clobTokenIds") or raw.get("clobTokenIdsRaw")
+    if isinstance(tokens, list):
+        first = tokens[0] if tokens else None
+        return str(first) if first else None
+    if isinstance(tokens, str):
+        stripped = tokens.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, list) and parsed:
+                    return str(parsed[0])
+            except json.JSONDecodeError:
+                pass
+        if stripped:
+            return stripped
+    return None
 
 
 def _parse_market(raw: dict[str, Any]) -> Market | None:
@@ -188,6 +225,7 @@ def _parse_market(raw: dict[str, Any]) -> Market | None:
         best_ask=ask,
         liquidity=liquidity,
         end_time=raw.get("endDate") or raw.get("endTime") or raw.get("end_time"),
+        token_id=_extract_token_id(raw),
     )
 
 
@@ -239,8 +277,8 @@ def build_intents(markets: list[Market], config: dict[str, Any]) -> list[OrderIn
 
         buy_price = max(0.0, min(1.0, m.best_bid + edge))
         sell_price = max(0.0, min(1.0, m.best_ask - edge))
-        intents.append(OrderIntent(market_id=m.market_id, side="buy", price=buy_price, size=order_size))
-        intents.append(OrderIntent(market_id=m.market_id, side="sell", price=sell_price, size=order_size))
+        intents.append(OrderIntent(market_id=m.market_id, side="buy", price=buy_price, size=order_size, token_id=m.token_id))
+        intents.append(OrderIntent(market_id=m.market_id, side="sell", price=sell_price, size=order_size, token_id=m.token_id))
     return intents
 
 
@@ -254,7 +292,6 @@ def risk_filter(intents: list[OrderIntent], engine: PaperEngine, cfg: dict[str, 
     max_order_notional = float(risk["max_order_notional"])
     max_market_exposure = float(risk["max_market_exposure"])
 
-    # Use local projected exposures so multiple intents in same loop stay bounded.
     projected_exposure: dict[str, float] = {}
     for intent in intents:
         notional = intent.price * intent.size
@@ -280,7 +317,9 @@ def execute_paper(intents: list[OrderIntent], markets: list[Market], engine: Pap
             settlement,
             {
                 "type": "order_open",
+                "exec_mode": "paper",
                 "market_id": intent.market_id,
+                "token_id": intent.token_id,
                 "side": intent.side,
                 "price": round(intent.price, 6),
                 "size": intent.size,
@@ -303,7 +342,9 @@ def execute_paper(intents: list[OrderIntent], markets: list[Market], engine: Pap
             settlement,
             {
                 "type": "fill",
+                "exec_mode": "paper",
                 "market_id": intent.market_id,
+                "token_id": intent.token_id,
                 "side": intent.side,
                 "price": round(intent.price, 6),
                 "size": intent.size,
@@ -312,11 +353,135 @@ def execute_paper(intents: list[OrderIntent], markets: list[Market], engine: Pap
     return fill_count
 
 
+def _normalize_order_type(value: str) -> Any:
+    value = value.upper()
+    try:
+        from py_clob_client.clob_types import OrderType
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("py-clob-client is not installed; run `pip install -r requirements.txt`") from exc
+
+    mapping = {
+        "FOK": getattr(OrderType, "FOK", None),
+        "GTC": getattr(OrderType, "GTC", None),
+        "GTD": getattr(OrderType, "GTD", None),
+    }
+    picked = mapping.get(value)
+    if picked is None:
+        raise ValueError(f"Unsupported live.order_type: {value}")
+    return picked
+
+
+def _side_constant(side: str) -> Any:
+    try:
+        from py_clob_client.order_builder.constants import BUY, SELL
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("py-clob-client is not installed; run `pip install -r requirements.txt`") from exc
+    return BUY if side == "buy" else SELL
+
+
+def create_live_client(config: dict[str, Any]) -> Any:
+    live = config.get("live", {})
+    private_key = os.getenv(live.get("private_key_env", "POLYMARKET_PRIVATE_KEY"), "").strip()
+    funder = os.getenv(live.get("funder_env", "POLYMARKET_FUNDER"), "").strip()
+
+    if not private_key:
+        raise RuntimeError(f"Missing private key env: {live.get('private_key_env', 'POLYMARKET_PRIVATE_KEY')}")
+    if not funder:
+        raise RuntimeError(f"Missing funder env: {live.get('funder_env', 'POLYMARKET_FUNDER')}")
+
+    try:
+        from py_clob_client.client import ClobClient
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("py-clob-client is not installed; run `pip install -r requirements.txt`") from exc
+
+    client = ClobClient(
+        host=live.get("host", "https://clob.polymarket.com"),
+        chain_id=int(live.get("chain_id", 137)),
+        key=private_key,
+        signature_type=int(live.get("signature_type", 1)),
+        funder=funder,
+    )
+
+    creds = client.create_or_derive_api_creds()
+    client.set_api_creds(creds)
+    return client
+
+
+def execute_live(intents: list[OrderIntent], client: Any, config: dict[str, Any], settlement: Path) -> int:
+    from py_clob_client.clob_types import OrderArgs
+
+    order_type = _normalize_order_type(str(config.get("live", {}).get("order_type", "FOK")))
+    posted = 0
+
+    for intent in intents:
+        if not intent.token_id:
+            LOGGER.warning("Skip live order: market_id=%s missing token_id", intent.market_id)
+            continue
+
+        write_event(
+            settlement,
+            {
+                "type": "order_open",
+                "exec_mode": "live",
+                "market_id": intent.market_id,
+                "token_id": intent.token_id,
+                "side": intent.side,
+                "price": round(intent.price, 6),
+                "size": intent.size,
+            },
+        )
+
+        try:
+            order_args = OrderArgs(
+                price=float(intent.price),
+                size=float(intent.size),
+                side=_side_constant(intent.side),
+                token_id=str(intent.token_id),
+            )
+            signed_order = client.create_order(order_args)
+            resp = client.post_order(signed_order, order_type)
+            posted += 1
+            write_event(
+                settlement,
+                {
+                    "type": "live_order_result",
+                    "market_id": intent.market_id,
+                    "token_id": intent.token_id,
+                    "side": intent.side,
+                    "price": round(intent.price, 6),
+                    "size": intent.size,
+                    "result": resp,
+                },
+            )
+        except Exception as exc:
+            LOGGER.warning("Live order failed market=%s side=%s err=%s", intent.market_id, intent.side, exc)
+            write_event(
+                settlement,
+                {
+                    "type": "live_order_error",
+                    "market_id": intent.market_id,
+                    "token_id": intent.token_id,
+                    "side": intent.side,
+                    "price": round(intent.price, 6),
+                    "size": intent.size,
+                    "error": str(exc),
+                },
+            )
+
+    return posted
+
+
 def run_loop(config: dict[str, Any], once: bool, interval: float | None) -> int:
     settlement = Path(config.get("settlement_file", "settlement.jsonl"))
     settlement.parent.mkdir(parents=True, exist_ok=True)
     settlement.touch(exist_ok=True)
+
+    mode = str(config.get("mode", "paper")).lower().strip()
+    if mode not in {"paper", "live"}:
+        raise ValueError(f"Unsupported mode: {mode}; expected paper/live")
+
     engine = PaperEngine(initial_equity=float(config["risk"]["initial_equity"]))
+    live_client = create_live_client(config) if mode == "live" else None
     sleep_sec = float(interval if interval is not None else config.get("run_interval_sec", 2.0))
 
     while True:
@@ -348,6 +513,7 @@ def run_loop(config: dict[str, Any], once: bool, interval: float | None) -> int:
                     "best_ask": m.best_ask,
                     "liquidity": m.liquidity,
                     "end_time": m.end_time,
+                    "token_id": m.token_id,
                 },
             )
 
@@ -358,7 +524,10 @@ def run_loop(config: dict[str, Any], once: bool, interval: float | None) -> int:
             LOGGER.warning("Daily loss halt triggered. Stop opening new orders.")
             return 0
 
-        fills = execute_paper(allowed, markets, engine, settlement)
+        if mode == "paper":
+            executed = execute_paper(allowed, markets, engine, settlement)
+        else:
+            executed = execute_live(allowed, live_client, config, settlement)
 
         position_rows = []
         for market_id, pos in engine.positions.items():
@@ -378,20 +547,21 @@ def run_loop(config: dict[str, Any], once: bool, interval: float | None) -> int:
             settlement,
             {
                 "type": "equity_snapshot",
-                "equity": round(engine.equity(), 6),
-                "realized_pnl": round(engine.realized_total(), 6),
-                "unrealized_pnl": round(engine.unrealized_total(), 6),
+                "equity": round(engine.equity(), 6) if mode == "paper" else None,
+                "realized_pnl": round(engine.realized_total(), 6) if mode == "paper" else None,
+                "unrealized_pnl": round(engine.unrealized_total(), 6) if mode == "paper" else None,
                 "halted": False,
+                "exec_mode": mode,
             },
         )
 
         LOGGER.info(
-            "markets=%s intents=%s allowed=%s fills=%s equity=%.2f",
+            "mode=%s markets=%s intents=%s allowed=%s executed=%s",
+            mode,
             len(markets),
             len(intents),
             len(allowed),
-            fills,
-            engine.equity(),
+            executed,
         )
 
         if once:
@@ -454,10 +624,7 @@ def report(config: dict[str, Any]) -> int:
 
     for e in today_events:
         t = e.get("type")
-        if t == "fill":
-            # Realized pnl is updated in snapshot; this keeps report tolerant to future schema changes.
-            pass
-        elif t == "equity_snapshot":
+        if t == "equity_snapshot":
             latest_equity = _to_float(e.get("equity"))
             latest_unrealized = _to_float(e.get("unrealized_pnl")) or 0.0
             today_realized = _to_float(e.get("realized_pnl")) or today_realized
@@ -499,7 +666,7 @@ def report(config: dict[str, Any]) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Polymarket MVP paper bot")
+    parser = argparse.ArgumentParser(description="Polymarket MVP bot (paper/live)")
     parser.add_argument("--config", type=Path, default=Path("config.yaml"), help="Config YAML path")
 
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -522,6 +689,7 @@ def main() -> int:
         return run_loop(config=config, once=bool(args.once), interval=args.interval)
     if args.cmd == "report":
         return report(config=config)
+
     parser.print_help()
     return 1
 

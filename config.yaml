@@ -1,3 +1,5 @@
+mode: paper
+
 gamma_url: "https://gamma-api.polymarket.com/markets"
 run_interval_sec: 2
 top_n: 5
@@ -14,3 +16,11 @@ risk:
   max_order_notional: 20
   max_market_exposure: 100
   daily_loss_limit: 50
+
+live:
+  host: "https://clob.polymarket.com"
+  chain_id: 137
+  signature_type: 1
+  private_key_env: "POLYMARKET_PRIVATE_KEY"
+  funder_env: "POLYMARKET_FUNDER"
+  order_type: "FOK"
