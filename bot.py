@@ -11,7 +11,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import requests
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
 import yaml
 
 LOGGER = logging.getLogger("polymarket_mvp")
@@ -26,6 +29,7 @@ class Market:
     liquidity: float
     end_time: str | None
     token_id: str | None
+    minutes_to_expiry: float | None
 
 
 @dataclass
@@ -70,6 +74,9 @@ DEFAULT_CONFIG = {
     "settlement_file": "settlement.jsonl",
     "request_timeout_sec": 8,
     "fetch_limit": 200,
+    "min_minutes_to_expiry": 30,
+    "max_orders_per_loop": 20,
+    "kill_switch_file": ".halt",
 }
 
 
@@ -146,6 +153,15 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def parse_iso_to_utc(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
 def load_config(config_path: Path) -> dict[str, Any]:
     config = json.loads(json.dumps(DEFAULT_CONFIG))
     if not config_path.exists():
@@ -218,18 +234,28 @@ def _parse_market(raw: dict[str, Any]) -> Market | None:
     if ask <= 0 or bid < 0 or ask < bid:
         return None
 
+    end_time = raw.get("endDate") or raw.get("endTime") or raw.get("end_time")
+    end_dt = parse_iso_to_utc(end_time)
+    minutes_to_expiry = None
+    if end_dt is not None:
+        minutes_to_expiry = (end_dt - datetime.now(timezone.utc)).total_seconds() / 60.0
+
     return Market(
         market_id=str(market_id),
         question=str(raw.get("question") or raw.get("title") or ""),
         best_bid=bid,
         best_ask=ask,
         liquidity=liquidity,
-        end_time=raw.get("endDate") or raw.get("endTime") or raw.get("end_time"),
+        end_time=end_time,
         token_id=_extract_token_id(raw),
+        minutes_to_expiry=minutes_to_expiry,
     )
 
 
 def fetch_markets(config: dict[str, Any]) -> list[Market]:
+    if requests is None:
+        raise RuntimeError("requests is not installed; run `pip install -r requirements.txt`")
+
     params = {
         "active": "true",
         "closed": "false",
@@ -252,11 +278,14 @@ def fetch_markets(config: dict[str, Any]) -> list[Market]:
 
     markets: list[Market] = []
     min_liquidity = float(config.get("min_liquidity", 0))
+    min_minutes_to_expiry = float(config.get("min_minutes_to_expiry", 0))
     for row in rows:
         parsed = _parse_market(row)
         if not parsed:
             continue
         if parsed.liquidity < min_liquidity:
+            continue
+        if parsed.minutes_to_expiry is not None and parsed.minutes_to_expiry < min_minutes_to_expiry:
             continue
         markets.append(parsed)
 
@@ -291,6 +320,7 @@ def risk_filter(intents: list[OrderIntent], engine: PaperEngine, cfg: dict[str, 
     allowed: list[OrderIntent] = []
     max_order_notional = float(risk["max_order_notional"])
     max_market_exposure = float(risk["max_market_exposure"])
+    max_orders_per_loop = int(cfg.get("max_orders_per_loop", 999999))
 
     projected_exposure: dict[str, float] = {}
     for intent in intents:
@@ -304,6 +334,8 @@ def risk_filter(intents: list[OrderIntent], engine: PaperEngine, cfg: dict[str, 
 
         projected_exposure[intent.market_id] = current + notional
         allowed.append(intent)
+        if len(allowed) >= max_orders_per_loop:
+            break
 
     return allowed, False
 
@@ -471,7 +503,7 @@ def execute_live(intents: list[OrderIntent], client: Any, config: dict[str, Any]
     return posted
 
 
-def run_loop(config: dict[str, Any], once: bool, interval: float | None) -> int:
+def run_loop(config: dict[str, Any], once: bool, interval: float | None, confirm_live: bool) -> int:
     settlement = Path(config.get("settlement_file", "settlement.jsonl"))
     settlement.parent.mkdir(parents=True, exist_ok=True)
     settlement.touch(exist_ok=True)
@@ -479,12 +511,20 @@ def run_loop(config: dict[str, Any], once: bool, interval: float | None) -> int:
     mode = str(config.get("mode", "paper")).lower().strip()
     if mode not in {"paper", "live"}:
         raise ValueError(f"Unsupported mode: {mode}; expected paper/live")
+    if mode == "live" and not confirm_live:
+        raise RuntimeError("Live mode blocked. Add --confirm-live to acknowledge real orders.")
 
     engine = PaperEngine(initial_equity=float(config["risk"]["initial_equity"]))
     live_client = create_live_client(config) if mode == "live" else None
     sleep_sec = float(interval if interval is not None else config.get("run_interval_sec", 2.0))
 
+    kill_switch = Path(str(config.get("kill_switch_file", ".halt")))
+
     while True:
+        if kill_switch.exists():
+            write_event(settlement, {"type": "halt", "reason": f"kill_switch:{kill_switch}"})
+            LOGGER.warning("Kill switch detected (%s). Stopping loop.", kill_switch)
+            return 0
         try:
             markets = fetch_markets(config)
         except Exception as exc:
@@ -673,6 +713,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p = sub.add_parser("run", help="Run strategy loop")
     run_p.add_argument("--once", action="store_true", help="Run only one loop")
     run_p.add_argument("--interval", type=float, default=None, help="Override loop interval seconds")
+    run_p.add_argument("--confirm-live", action="store_true", help="Required when mode=live to allow real orders")
 
     sub.add_parser("report", help="Show today's pnl/positions/halt")
     return parser
@@ -686,7 +727,12 @@ def main() -> int:
     config = load_config(args.config)
 
     if args.cmd == "run":
-        return run_loop(config=config, once=bool(args.once), interval=args.interval)
+        return run_loop(
+            config=config,
+            once=bool(args.once),
+            interval=args.interval,
+            confirm_live=bool(getattr(args, "confirm_live", False)),
+        )
     if args.cmd == "report":
         return report(config=config)
 

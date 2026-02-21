@@ -10,6 +10,9 @@ order_edge: 0.005
 settlement_file: "settlement.jsonl"
 request_timeout_sec: 8
 fetch_limit: 200
+min_minutes_to_expiry: 30
+max_orders_per_loop: 20
+kill_switch_file: ".halt"
 
 risk:
   initial_equity: 1000
