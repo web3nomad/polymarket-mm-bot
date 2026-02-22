@@ -1,4 +1,4 @@
-mode: paper
+mode: live
 
 gamma_url: "https://gamma-api.polymarket.com/markets"
 run_interval_sec: 2
@@ -27,3 +27,5 @@ live:
   private_key_env: "POLYMARKET_PRIVATE_KEY"
   funder_env: "POLYMARKET_FUNDER"
   order_type: "FOK"
+  min_order_usd: 1.0
+  allow_sell: false

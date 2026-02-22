@@ -74,6 +74,8 @@ touch .halt
 - `min_minutes_to_expiry / max_orders_per_loop / kill_switch_file`
 - `risk.max_order_notional / risk.max_market_exposure / risk.daily_loss_limit`
 - `live.host / live.chain_id / live.signature_type / live.private_key_env / live.funder_env / live.order_type`
+- `live.min_order_usd`（live 最小下单金额过滤，默认 1.0）
+- `live.allow_sell`（默认 `false`，避免无持仓/无 allowance 的卖单报错）
 
 ## 文档
 

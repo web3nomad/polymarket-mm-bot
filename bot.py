@@ -71,6 +71,8 @@ DEFAULT_CONFIG = {
         "private_key_env": "POLYMARKET_PRIVATE_KEY",
         "funder_env": "POLYMARKET_FUNDER",
         "order_type": "FOK",
+        "min_order_usd": 1.0,
+        "allow_sell": False,
     },
     "settlement_file": "settlement.jsonl",
     "request_timeout_sec": 8,
@@ -105,7 +107,9 @@ class PaperEngine:
 
         if (pos.size > 0 and signed > 0) or (pos.size < 0 and signed < 0):
             total_abs = abs(pos.size) + abs(signed)
-            pos.avg_entry = ((abs(pos.size) * pos.avg_entry) + (abs(signed) * price)) / max(total_abs, 1e-12)
+            pos.avg_entry = (
+                (abs(pos.size) * pos.avg_entry) + (abs(signed) * price)
+            ) / max(total_abs, 1e-12)
             pos.size += signed
             return 0.0
 
@@ -151,14 +155,21 @@ class PaperEngine:
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def parse_iso_to_utc(ts: str | None) -> datetime | None:
     if not ts:
         return None
     try:
-        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(timezone.utc)
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(
+            timezone.utc
+        )
     except Exception:
         return None
 
@@ -226,9 +237,15 @@ def _parse_market(raw: dict[str, Any]) -> Market | None:
     if market_id is None:
         return None
 
-    bid = _to_float(raw.get("bestBid") if raw.get("bestBid") is not None else raw.get("best_bid"))
-    ask = _to_float(raw.get("bestAsk") if raw.get("bestAsk") is not None else raw.get("best_ask"))
-    liquidity = _to_float(raw.get("liquidity") or raw.get("liquidityNum") or raw.get("volume24hr"))
+    bid = _to_float(
+        raw.get("bestBid") if raw.get("bestBid") is not None else raw.get("best_bid")
+    )
+    ask = _to_float(
+        raw.get("bestAsk") if raw.get("bestAsk") is not None else raw.get("best_ask")
+    )
+    liquidity = _to_float(
+        raw.get("liquidity") or raw.get("liquidityNum") or raw.get("volume24hr")
+    )
 
     if bid is None or ask is None or liquidity is None:
         return None
@@ -255,7 +272,9 @@ def _parse_market(raw: dict[str, Any]) -> Market | None:
 
 def fetch_markets(config: dict[str, Any]) -> list[Market]:
     if requests is None:
-        raise RuntimeError("requests is not installed; run `pip install -r requirements.txt`")
+        raise RuntimeError(
+            "requests is not installed; run `pip install -r requirements.txt`"
+        )
 
     params = {
         "active": "true",
@@ -286,7 +305,10 @@ def fetch_markets(config: dict[str, Any]) -> list[Market]:
             continue
         if parsed.liquidity < min_liquidity:
             continue
-        if parsed.minutes_to_expiry is not None and parsed.minutes_to_expiry < min_minutes_to_expiry:
+        if (
+            parsed.minutes_to_expiry is not None
+            and parsed.minutes_to_expiry < min_minutes_to_expiry
+        ):
             continue
         markets.append(parsed)
 
@@ -307,14 +329,34 @@ def build_intents(markets: list[Market], config: dict[str, Any]) -> list[OrderIn
 
         buy_price = max(0.0, min(1.0, m.best_bid + edge))
         sell_price = max(0.0, min(1.0, m.best_ask - edge))
-        intents.append(OrderIntent(market_id=m.market_id, side="buy", price=buy_price, size=order_size, token_id=m.token_id))
-        intents.append(OrderIntent(market_id=m.market_id, side="sell", price=sell_price, size=order_size, token_id=m.token_id))
+        intents.append(
+            OrderIntent(
+                market_id=m.market_id,
+                side="buy",
+                price=buy_price,
+                size=order_size,
+                token_id=m.token_id,
+            )
+        )
+        intents.append(
+            OrderIntent(
+                market_id=m.market_id,
+                side="sell",
+                price=sell_price,
+                size=order_size,
+                token_id=m.token_id,
+            )
+        )
     return intents
 
 
-def risk_filter(intents: list[OrderIntent], engine: PaperEngine, cfg: dict[str, Any]) -> tuple[list[OrderIntent], bool]:
+def risk_filter(
+    intents: list[OrderIntent], engine: PaperEngine, cfg: dict[str, Any]
+) -> tuple[list[OrderIntent], bool]:
     risk = cfg["risk"]
-    halted = engine.equity() <= float(risk["initial_equity"]) - float(risk["daily_loss_limit"])
+    halted = engine.equity() <= float(risk["initial_equity"]) - float(
+        risk["daily_loss_limit"]
+    )
     if halted:
         return [], True
 
@@ -322,14 +364,22 @@ def risk_filter(intents: list[OrderIntent], engine: PaperEngine, cfg: dict[str, 
     max_order_notional = float(risk["max_order_notional"])
     max_market_exposure = float(risk["max_market_exposure"])
     max_orders_per_loop = int(cfg.get("max_orders_per_loop", 999999))
+    mode = str(cfg.get("mode", "paper")).lower().strip()
+    live_min_order_usd = (
+        float(cfg.get("live", {}).get("min_order_usd", 0.0)) if mode == "live" else 0.0
+    )
 
     projected_exposure: dict[str, float] = {}
     for intent in intents:
         notional = intent.price * intent.size
         if notional > max_order_notional:
             continue
+        if live_min_order_usd > 0 and notional < live_min_order_usd:
+            continue
 
-        current = projected_exposure.get(intent.market_id, engine.market_exposure(intent.market_id))
+        current = projected_exposure.get(
+            intent.market_id, engine.market_exposure(intent.market_id)
+        )
         if current + notional > max_market_exposure:
             continue
 
@@ -341,7 +391,12 @@ def risk_filter(intents: list[OrderIntent], engine: PaperEngine, cfg: dict[str, 
     return allowed, False
 
 
-def execute_paper(intents: list[OrderIntent], markets: list[Market], engine: PaperEngine, settlement: Path) -> int:
+def execute_paper(
+    intents: list[OrderIntent],
+    markets: list[Market],
+    engine: PaperEngine,
+    settlement: Path,
+) -> int:
     by_id = {m.market_id: m for m in markets}
     fill_count = 0
 
@@ -391,7 +446,9 @@ def _normalize_order_type(value: str) -> Any:
     try:
         from py_clob_client.clob_types import OrderType
     except Exception as exc:  # pragma: no cover
-        raise RuntimeError("py-clob-client is not installed; run `pip install -r requirements.txt`") from exc
+        raise RuntimeError(
+            "py-clob-client is not installed; run `pip install -r requirements.txt`"
+        ) from exc
 
     mapping = {
         "FOK": getattr(OrderType, "FOK", None),
@@ -408,24 +465,34 @@ def _side_constant(side: str) -> Any:
     try:
         from py_clob_client.order_builder.constants import BUY, SELL
     except Exception as exc:  # pragma: no cover
-        raise RuntimeError("py-clob-client is not installed; run `pip install -r requirements.txt`") from exc
+        raise RuntimeError(
+            "py-clob-client is not installed; run `pip install -r requirements.txt`"
+        ) from exc
     return BUY if side == "buy" else SELL
 
 
 def create_live_client(config: dict[str, Any]) -> Any:
     live = config.get("live", {})
-    private_key = os.getenv(live.get("private_key_env", "POLYMARKET_PRIVATE_KEY"), "").strip()
+    private_key = os.getenv(
+        live.get("private_key_env", "POLYMARKET_PRIVATE_KEY"), ""
+    ).strip()
     funder = os.getenv(live.get("funder_env", "POLYMARKET_FUNDER"), "").strip()
 
     if not private_key:
-        raise RuntimeError(f"Missing private key env: {live.get('private_key_env', 'POLYMARKET_PRIVATE_KEY')}")
+        raise RuntimeError(
+            f"Missing private key env: {live.get('private_key_env', 'POLYMARKET_PRIVATE_KEY')}"
+        )
     if not funder:
-        raise RuntimeError(f"Missing funder env: {live.get('funder_env', 'POLYMARKET_FUNDER')}")
+        raise RuntimeError(
+            f"Missing funder env: {live.get('funder_env', 'POLYMARKET_FUNDER')}"
+        )
 
     try:
         from py_clob_client.client import ClobClient
     except Exception as exc:  # pragma: no cover
-        raise RuntimeError("py-clob-client is not installed; run `pip install -r requirements.txt`") from exc
+        raise RuntimeError(
+            "py-clob-client is not installed; run `pip install -r requirements.txt`"
+        ) from exc
 
     client = ClobClient(
         host=live.get("host", "https://clob.polymarket.com"),
@@ -440,15 +507,26 @@ def create_live_client(config: dict[str, Any]) -> Any:
     return client
 
 
-def execute_live(intents: list[OrderIntent], client: Any, config: dict[str, Any], settlement: Path) -> int:
+def execute_live(
+    intents: list[OrderIntent], client: Any, config: dict[str, Any], settlement: Path
+) -> int:
     from py_clob_client.clob_types import OrderArgs
 
-    order_type = _normalize_order_type(str(config.get("live", {}).get("order_type", "FOK")))
+    live_cfg = config.get("live", {})
+    order_type = _normalize_order_type(str(live_cfg.get("order_type", "FOK")))
+    allow_sell = bool(live_cfg.get("allow_sell", False))
     posted = 0
 
     for intent in intents:
+        if intent.side == "sell" and not allow_sell:
+            LOGGER.info(
+                "Skip live sell order (allow_sell=false): market_id=%s", intent.market_id
+            )
+            continue
         if not intent.token_id:
-            LOGGER.warning("Skip live order: market_id=%s missing token_id", intent.market_id)
+            LOGGER.warning(
+                "Skip live order: market_id=%s missing token_id", intent.market_id
+            )
             continue
 
         write_event(
@@ -487,7 +565,12 @@ def execute_live(intents: list[OrderIntent], client: Any, config: dict[str, Any]
                 },
             )
         except Exception as exc:
-            LOGGER.warning("Live order failed market=%s side=%s err=%s", intent.market_id, intent.side, exc)
+            LOGGER.warning(
+                "Live order failed market=%s side=%s err=%s",
+                intent.market_id,
+                intent.side,
+                exc,
+            )
             write_event(
                 settlement,
                 {
@@ -504,7 +587,9 @@ def execute_live(intents: list[OrderIntent], client: Any, config: dict[str, Any]
     return posted
 
 
-def run_loop(config: dict[str, Any], once: bool, interval: float | None, confirm_live: bool) -> int:
+def run_loop(
+    config: dict[str, Any], once: bool, interval: float | None, confirm_live: bool
+) -> int:
     settlement = Path(config.get("settlement_file", "settlement.jsonl"))
     settlement.parent.mkdir(parents=True, exist_ok=True)
     settlement.touch(exist_ok=True)
@@ -513,17 +598,23 @@ def run_loop(config: dict[str, Any], once: bool, interval: float | None, confirm
     if mode not in {"paper", "live"}:
         raise ValueError(f"Unsupported mode: {mode}; expected paper/live")
     if mode == "live" and not confirm_live:
-        raise RuntimeError("Live mode blocked. Add --confirm-live to acknowledge real orders.")
+        raise RuntimeError(
+            "Live mode blocked. Add --confirm-live to acknowledge real orders."
+        )
 
     engine = PaperEngine(initial_equity=float(config["risk"]["initial_equity"]))
     live_client = create_live_client(config) if mode == "live" else None
-    sleep_sec = float(interval if interval is not None else config.get("run_interval_sec", 2.0))
+    sleep_sec = float(
+        interval if interval is not None else config.get("run_interval_sec", 2.0)
+    )
 
     kill_switch = Path(str(config.get("kill_switch_file", ".halt")))
 
     while True:
         if kill_switch.exists():
-            write_event(settlement, {"type": "halt", "reason": f"kill_switch:{kill_switch}"})
+            write_event(
+                settlement, {"type": "halt", "reason": f"kill_switch:{kill_switch}"}
+            )
             LOGGER.warning("Kill switch detected (%s). Stopping loop.", kill_switch)
             return 0
         try:
@@ -583,14 +674,20 @@ def run_loop(config: dict[str, Any], once: bool, interval: float | None, confirm
                 }
             )
 
-        write_event(settlement, {"type": "position_snapshot", "positions": position_rows})
+        write_event(
+            settlement, {"type": "position_snapshot", "positions": position_rows}
+        )
         write_event(
             settlement,
             {
                 "type": "equity_snapshot",
                 "equity": round(engine.equity(), 6) if mode == "paper" else None,
-                "realized_pnl": round(engine.realized_total(), 6) if mode == "paper" else None,
-                "unrealized_pnl": round(engine.unrealized_total(), 6) if mode == "paper" else None,
+                "realized_pnl": round(engine.realized_total(), 6)
+                if mode == "paper"
+                else None,
+                "unrealized_pnl": round(engine.unrealized_total(), 6)
+                if mode == "paper"
+                else None,
                 "halted": False,
                 "exec_mode": mode,
             },
@@ -646,7 +743,11 @@ def report(config: dict[str, Any]) -> int:
             json.dumps(
                 {
                     "date_utc": datetime.now(timezone.utc).date().isoformat(),
-                    "today": {"realized_pnl": 0.0, "unrealized_pnl": 0.0, "equity": None},
+                    "today": {
+                        "realized_pnl": 0.0,
+                        "unrealized_pnl": 0.0,
+                        "equity": None,
+                    },
                     "current_positions": [],
                     "halted": False,
                     "settlement_file": str(settlement),
@@ -697,7 +798,9 @@ def report(config: dict[str, Any]) -> int:
             "unrealized_pnl": round(latest_unrealized, 6),
             "equity": round(latest_equity, 6) if latest_equity is not None else None,
         },
-        "current_positions": [p for p in current_positions.values() if abs(p["size"]) > 1e-12],
+        "current_positions": [
+            p for p in current_positions.values() if abs(p["size"]) > 1e-12
+        ],
         "halted": halted,
         "settlement_file": str(settlement),
     }
@@ -708,13 +811,21 @@ def report(config: dict[str, Any]) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Polymarket MVP bot (paper/live)")
-    parser.add_argument("--config", type=Path, default=Path("config.yaml"), help="Config YAML path")
+    parser.add_argument(
+        "--config", type=Path, default=Path("config.yaml"), help="Config YAML path"
+    )
 
     sub = parser.add_subparsers(dest="cmd", required=True)
     run_p = sub.add_parser("run", help="Run strategy loop")
     run_p.add_argument("--once", action="store_true", help="Run only one loop")
-    run_p.add_argument("--interval", type=float, default=None, help="Override loop interval seconds")
-    run_p.add_argument("--confirm-live", action="store_true", help="Required when mode=live to allow real orders")
+    run_p.add_argument(
+        "--interval", type=float, default=None, help="Override loop interval seconds"
+    )
+    run_p.add_argument(
+        "--confirm-live",
+        action="store_true",
+        help="Required when mode=live to allow real orders",
+    )
 
     sub.add_parser("report", help="Show today's pnl/positions/halt")
     return parser
@@ -724,7 +835,9 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     load_dotenv()
     config = load_config(args.config)
 
