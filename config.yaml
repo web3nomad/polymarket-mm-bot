@@ -2,9 +2,9 @@ mode: live
 
 gamma_url: "https://gamma-api.polymarket.com/markets"
 run_interval_sec: 2
-top_n: 10
-min_liquidity: 1000
-min_spread: 0.02
+top_n: 20
+min_liquidity: 500
+min_spread: 0.005
 min_minutes_to_expiry: 30
 fetch_limit: 200
 request_timeout_sec: 8
@@ -13,10 +13,10 @@ kill_switch_file: ".halt"
 settlement_file: "settlement.jsonl"
 
 risk:
-  initial_equity: 10
-  max_order_notional: 2
-  max_market_exposure: 5
-  daily_loss_limit: 3
+  initial_equity: 50
+  max_order_notional: 6
+  max_market_exposure: 12
+  daily_loss_limit: 10
   use_kelly: true
   kelly_fraction: 0.5
   min_confidence: 0.3
@@ -24,19 +24,19 @@ risk:
 strategies:
   market_making:
     enabled: true
-    min_spread: 0.02
+    min_spread: 0.008
     edge: 0.005
     order_size: 10
   arbitrage:
     enabled: true
     threshold: 0.02
-    order_size: 50
+    order_size: 8
   momentum:
     enabled: true
     lookback_trades: 20
     buy_threshold: 0.3
     sell_threshold: -0.3
-    order_size: 20
+    order_size: 8
   mean_reversion:
     enabled: false
     lookback_trades: 50
@@ -52,6 +52,7 @@ live:
   order_type: "GTC"
   min_order_usd: 1.0
   exchange_min_order_usd: 1.0
+  exchange_min_shares: 5
   allow_sell: false
   trade_side: "buy"
   marketable_buffer: 0.0

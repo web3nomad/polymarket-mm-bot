@@ -30,6 +30,7 @@ class RiskManager:
             float(live.get("min_order_usd", 0)),
             float(live.get("exchange_min_order_usd", 1.0)),
         )
+        self.exchange_min_shares = float(live.get("exchange_min_shares", 5))
 
     def is_halted(self, portfolio: PortfolioState) -> bool:
         return portfolio.equity <= self.initial_equity - self.daily_loss_limit
@@ -109,12 +110,20 @@ class RiskManager:
             if size <= 0:
                 continue
 
+            # Enforce exchange minimum shares
+            if self.mode == "live" and size < self.exchange_min_shares:
+                size = self.exchange_min_shares
+
             notional = signal.price * size
 
             # Notional bounds
             if notional > self.max_order_notional:
                 size = self.max_order_notional / signal.price
                 notional = self.max_order_notional
+
+            # Re-check min shares after notional cap
+            if self.mode == "live" and size < self.exchange_min_shares:
+                continue
 
             if self.mode == "live" and notional < self.min_order_usd:
                 continue
