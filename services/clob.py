@@ -77,15 +77,20 @@ def _classify_error(error: Any = None, response: dict | None = None) -> str:
 
 
 def get_usdc_balance(client: Any) -> float:
-    """Get USDC balance in dollars (handles micro-USDC conversion)."""
+    """Get USDC balance in dollars. USDC on Polygon always has 6 decimals."""
     from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
     try:
         result = client.get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
         raw = float(result.get("balance", 0))
-        # Balance is in micro-USDC (6 decimals) if > 1000, else already dollars
-        return raw / 1e6 if raw > 1000 else raw
+        # USDC on Polygon: 6 decimals. Always divide by 1e6.
+        # If the result looks like it's already in dollars (has a decimal point
+        # in the raw API string and value < 100_000), trust it as-is.
+        raw_str = str(result.get("balance", "0"))
+        if "." in raw_str and raw < 100_000:
+            return raw
+        return raw / 1e6
     except Exception as e:
         LOGGER.warning("Failed to get USDC balance: %s", e)
         return 0.0
@@ -257,25 +262,11 @@ def execute_live(
             success = bool(resp.get("success"))
             status = str(resp.get("status", "")).lower()
 
-            if success and status == "matched":
-                pos = portfolio.positions.setdefault(intent.token_id, Position())
-                pos.apply_fill(intent.side, intent.price, intent.size)
+            if success:
+                # Log only. Don't update portfolio — next loop's sync will
+                # reflect the real state from the exchange.
                 write_event(settlement, {
-                    "type": "fill",
-                    "exec_mode": "live",
-                    "token_id": intent.token_id,
-                    "side": intent.side,
-                    "price": round(intent.price, 6),
-                    "size": intent.size,
-                    "strategy": intent.strategy,
-                })
-            elif success:
-                # GTC order accepted but not immediately matched —
-                # count as pending exposure so next loop won't double up
-                pos = portfolio.positions.setdefault(intent.token_id, Position())
-                pos.apply_fill(intent.side, intent.price, intent.size)
-                write_event(settlement, {
-                    "type": "pending_order",
+                    "type": "fill" if status == "matched" else "pending_order",
                     "exec_mode": "live",
                     "token_id": intent.token_id,
                     "side": intent.side,
@@ -284,7 +275,7 @@ def execute_live(
                     "strategy": intent.strategy,
                     "status": status,
                 })
-            elif not success or status in ("killed", "cancelled", "rejected"):
+            else:
                 error_class = _classify_error(response=resp)
                 write_event(settlement, {
                     "type": "live_order_error",

@@ -28,6 +28,5 @@ htmlcov/
 # Secrets
 .env
 
-# Local data
-data/*.sqlite3
-settlement.jsonl
+# Runtime data (all in data/)
+data/

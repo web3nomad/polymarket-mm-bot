@@ -11,10 +11,11 @@ from core.config import load_config
 from core.events import write_event
 from core.models import Market, OrderIntent, PortfolioState, Position
 from core.risk import RiskManager
-from services.clob import create_live_client, execute_live, execute_paper, sync_positions
+from services.clob import create_live_client, execute_live, execute_paper, get_usdc_balance, sync_positions
 from services.gamma import fetch_markets
 from strategies.arbitrage import ArbitrageStrategy
 from strategies.base import BaseStrategy
+from strategies.copy_trading import CopyTradingStrategy
 from strategies.market_making import MarketMakingStrategy
 from strategies.mean_reversion import MeanReversionStrategy
 from strategies.momentum import MomentumStrategy
@@ -27,11 +28,12 @@ def _build_strategies(config: dict[str, Any]) -> list[BaseStrategy]:
     """Instantiate all enabled strategies from config."""
     strat_cfg = config.get("strategies", {})
     registry: list[tuple[str, type[BaseStrategy]]] = [
+        ("position_manager", PositionManagerStrategy),
+        ("copy_trading", CopyTradingStrategy),
         ("market_making", MarketMakingStrategy),
         ("arbitrage", ArbitrageStrategy),
         ("momentum", MomentumStrategy),
         ("mean_reversion", MeanReversionStrategy),
-        ("position_manager", PositionManagerStrategy),
     ]
     active: list[BaseStrategy] = []
     for name, cls in registry:
@@ -136,8 +138,6 @@ def run_loop(config: dict[str, Any], once: bool, interval: float | None, confirm
             write_event(settlement, {"type": "halt", "reason": "live_client_init_failed", "error": str(exc)})
             return 1
 
-    last_position_sync = 0.0
-    position_sync_interval = 30.0  # Re-sync positions every 30s
     cooldowns: dict[str, float] = {}
     sleep_sec = float(interval if interval is not None else config.get("run_interval_sec", 2.0))
     kill_switch = Path(str(config.get("kill_switch_file", ".halt")))
@@ -170,25 +170,22 @@ def run_loop(config: dict[str, Any], once: bool, interval: float | None, confirm
                 time.sleep(sleep_sec)
                 continue
 
-            # Sync live positions periodically
-            now = time.time()
-            if mode == "live" and now - last_position_sync >= position_sync_interval and config.get("live", {}).get("sync_existing_positions", True):
+            # ── GROUND TRUTH: sync state from exchange every loop ──
+            if mode == "live":
                 try:
-                    synced = sync_positions(live_client, config, markets)
-                    for token_id, pos in synced.items():
-                        if abs(pos.size) > 1e-12:
-                            portfolio.positions[token_id] = pos
-                    last_position_sync = now
-                    write_event(settlement, {
-                        "type": "position_sync",
-                        "exec_mode": "live",
-                        "synced_count": len([p for p in synced.values() if abs(p.size) > 1e-12]),
-                    })
+                    real_balance = get_usdc_balance(live_client)
+                    real_positions = sync_positions(live_client, config, markets)
+                    # Overwrite — exchange is the source of truth
+                    portfolio.cash = real_balance
+                    portfolio.positions = {
+                        tid: pos for tid, pos in real_positions.items()
+                        if abs(pos.size) > 1e-12
+                    }
+                    risk_mgr.live_balance = real_balance
                 except Exception as exc:
-                    LOGGER.warning("Position sync failed: %s", exc)
-                    last_position_sync = now  # Don't retry immediately
+                    LOGGER.warning("Exchange sync failed: %s", exc)
 
-            # Update prices
+            # Update prices and equity
             for m in markets:
                 portfolio.last_prices[m.token_id] = m.mid_price
             portfolio.update_equity()
@@ -222,17 +219,21 @@ def run_loop(config: dict[str, Any], once: bool, interval: float | None, confirm
             else:
                 executed = execute_live(intents, live_client, config, portfolio, settlement, cooldowns)
 
-            # Update equity after fills
-            portfolio.update_equity()
-
-            # Log snapshots
+            # Log
             _log_positions(settlement, portfolio)
             _log_equity(settlement, portfolio, mode, False)
             _log_loop(settlement, mode, len(markets), len(all_signals), len(intents), executed, strategies_used)
 
+            pos_count = sum(1 for p in portfolio.positions.values() if abs(p.size) > 0.01)
+            pos_value = sum(
+                p.size * portfolio.last_prices.get(tid, p.avg_entry)
+                for tid, p in portfolio.positions.items() if abs(p.size) > 0.01
+            )
             LOGGER.info(
-                "mode=%s markets=%d signals=%d intents=%d executed=%d equity=%.2f",
-                mode, len(markets), len(all_signals), len(intents), executed, portfolio.equity,
+                "余额=$%.2f 持仓=$%.2f(%d个) 总值=$%.2f | signals=%d executed=%d",
+                portfolio.cash, pos_value, pos_count,
+                portfolio.cash + pos_value,
+                len(all_signals), executed,
             )
 
             if once:

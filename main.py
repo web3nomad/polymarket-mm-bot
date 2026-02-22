@@ -80,6 +80,88 @@ def report(config: dict) -> int:
     return 0
 
 
+def status(config: dict) -> int:
+    """Show live wallet status: balance, open orders, positions."""
+    from services.clob import create_live_client, get_usdc_balance
+
+    client = create_live_client(config)
+    balance = get_usdc_balance(client)
+
+    # Open orders
+    orders = []
+    order_locked = 0.0
+    try:
+        raw = client.get_orders()
+        if raw:
+            for o in raw:
+                side = o.get("side", "?")
+                price = float(o.get("price", 0))
+                orig = float(o.get("original_size", 0) or o.get("size", 0))
+                matched = float(o.get("size_matched", 0) or 0)
+                remaining = orig - matched
+                if side.upper() == "BUY":
+                    order_locked += price * remaining
+                orders.append({
+                    "side": side,
+                    "price": price,
+                    "size": orig,
+                    "remaining": round(remaining, 2),
+                    "token": str(o.get("asset_id", ""))[:16] + "...",
+                })
+    except Exception as e:
+        orders = [{"error": str(e)}]
+
+    # Positions from exchange
+    positions = []
+    position_value = 0.0
+    try:
+        from services.gamma import fetch_markets
+        markets = fetch_markets(config)
+        price_map = {m.token_id: m.mid_price for m in markets}
+
+        from services.clob import sync_positions
+        synced = sync_positions(client, config, markets)
+        for token_id, pos in synced.items():
+            if abs(pos.size) < 0.01:
+                continue
+            mid = price_map.get(token_id, pos.avg_entry)
+            val = pos.size * mid
+            pnl_pct = ((mid - pos.avg_entry) / pos.avg_entry * 100) if pos.avg_entry > 0 else 0
+            position_value += val
+            positions.append({
+                "token": token_id[:16] + "...",
+                "size": round(pos.size, 2),
+                "entry": round(pos.avg_entry, 4),
+                "mid": round(mid, 4),
+                "value": round(val, 2),
+                "pnl%": round(pnl_pct, 1),
+            })
+    except Exception as e:
+        positions = [{"error": str(e)}]
+
+    total = balance + order_locked + position_value
+    print(f"\n{'='*50}")
+    print(f"  USDC 余额:    ${balance:.2f}")
+    print(f"  挂单锁定:     ${order_locked:.2f}  ({len([o for o in orders if 'error' not in o])}个)")
+    print(f"  持仓市值:     ${position_value:.2f}  ({len([p for p in positions if 'error' not in p])}个)")
+    print(f"  总计:         ${total:.2f}")
+    print(f"{'='*50}")
+
+    if positions and "error" not in positions[0]:
+        print("\n持仓明细:")
+        for p in sorted(positions, key=lambda x: x.get("value", 0), reverse=True):
+            emoji = "+" if p["pnl%"] >= 0 else ""
+            print(f"  {p['size']:>8.1f} @ {p['entry']:.3f}  现价{p['mid']:.3f}  值${p['value']:.1f}  {emoji}{p['pnl%']:.1f}%")
+
+    if orders and "error" not in orders[0]:
+        print(f"\n挂单明细:")
+        for o in orders:
+            print(f"  {o['side']:>4} {o['remaining']:.1f}@{o['price']:.3f}")
+
+    print()
+    return 0
+
+
 def watch(config: dict, follow: bool, interval: float, tail: int) -> int:
     """Stream recent settlement events."""
     import time
@@ -120,6 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--interval", type=float, default=None, help="Override loop interval (sec)")
     run_p.add_argument("--confirm-live", action="store_true", help="Required for live mode")
 
+    sub.add_parser("status", help="Live wallet: balance, orders, positions")
     sub.add_parser("report", help="Show today's P&L and positions")
 
     watch_p = sub.add_parser("watch", help="Watch settlement events")
@@ -145,6 +228,8 @@ def main() -> int:
             interval=args.interval,
             confirm_live=bool(getattr(args, "confirm_live", False)),
         )
+    if args.cmd == "status":
+        return status(config)
     if args.cmd == "report":
         return report(config)
     if args.cmd == "watch":

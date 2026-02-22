@@ -17,8 +17,8 @@ source .venv/bin/activate
 python main.py run --confirm-live
 
 # background (daemon)
-nohup python main.py run --confirm-live > engine.log 2>&1 &
-echo $! > engine.pid
+nohup python main.py run --confirm-live > data/engine.log 2>&1 &
+echo $! > data/engine.pid
 ```
 
 ### Stop Engine
@@ -32,7 +32,7 @@ touch .halt
 ### Emergency Kill
 
 ```bash
-kill $(cat engine.pid)
+kill $(cat data/engine.pid)
 # or
 pkill -f "main.py run"
 ```
@@ -41,13 +41,13 @@ pkill -f "main.py run"
 
 ```bash
 # real-time log
-tail -f engine.log
+tail -f data/engine.log
 
 # summary only
-grep "mode=live" engine.log | tail -20
+grep "mode=live" data/engine.log | tail -20
 
 # errors/warnings
-grep "WARNING\|ERROR" engine.log | tail -20
+grep "WARNING\|ERROR" data/engine.log | tail -20
 
 # portfolio report (equity, PnL, positions)
 python main.py report
@@ -129,8 +129,8 @@ python main.py run --once --confirm-live
 config.yaml          # all configuration
 .env                 # POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER
 .halt                # touch to stop, rm to allow restart
-engine.log           # runtime log (when running as daemon)
-engine.pid           # PID file
+data/engine.log           # runtime log (when running as daemon)
+data/engine.pid           # PID file
 settlement.jsonl     # all order events (append-only audit log)
 
 main.py              # CLI entry point
@@ -205,9 +205,9 @@ grep '"type": "live_order_error"' settlement.jsonl | wc -l
 | Check | Command | Healthy |
 |-------|---------|---------|
 | Engine running? | `ps aux \| grep main.py` | process exists |
-| Recent activity? | `tail -1 engine.log` | timestamp < 10s ago |
-| Orders executing? | `grep executed engine.log \| tail -1` | executed > 0 |
-| No errors? | `grep ERROR engine.log \| tail -5` | empty or rare |
+| Recent activity? | `tail -1 data/engine.log` | timestamp < 10s ago |
+| Orders executing? | `grep executed data/engine.log \| tail -1` | executed > 0 |
+| No errors? | `grep ERROR data/engine.log \| tail -5` | empty or rare |
 | Balance OK? | `python main.py report` | equity > 0 |
 | Kill switch off? | `ls .halt 2>/dev/null` | file not found |
 

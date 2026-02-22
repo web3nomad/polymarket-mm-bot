@@ -10,7 +10,7 @@ fetch_limit: 200
 request_timeout_sec: 8
 max_orders_per_loop: 20
 kill_switch_file: ".halt"
-settlement_file: "settlement.jsonl"
+settlement_file: "data/settlement.jsonl"
 
 risk:
   initial_equity: 50
@@ -20,6 +20,8 @@ risk:
   use_kelly: true
   kelly_fraction: 0.5
   min_confidence: 0.3
+  cash_reserve_pct: 0.25
+  max_positions: 5
 
 strategies:
   market_making:
@@ -28,11 +30,11 @@ strategies:
     edge: 0.005
     order_size: 10
   arbitrage:
-    enabled: true
+    enabled: false
     threshold: 0.02
     order_size: 8
   momentum:
-    enabled: true
+    enabled: false
     lookback_trades: 20
     buy_threshold: 0.3
     sell_threshold: -0.3
@@ -42,6 +44,16 @@ strategies:
     lookback_trades: 50
     std_threshold: 2.0
     order_size: 20
+  copy_trading:
+    enabled: true
+    top_n_traders: 10
+    size_multiplier: 0.25
+    min_trader_profit: 500
+    min_win_rate: 0.55
+    activity_limit: 20
+    refresh_interval_sec: 300
+    max_trade_age_sec: 3600
+    order_size: 5
   position_manager:
     enabled: true
     take_profit_pct: 0.05

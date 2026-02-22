@@ -141,7 +141,13 @@ class PortfolioState:
         return sum(p.realized_pnl for p in self.positions.values())
 
     def update_equity(self) -> None:
-        self.equity = self.cash + self.unrealized_pnl() + self.realized_pnl()
+        # equity = cash (real USDC balance) + market value of all positions
+        position_value = sum(
+            pos.size * self.last_prices.get(tid, pos.avg_entry)
+            for tid, pos in self.positions.items()
+            if abs(pos.size) > 1e-12
+        )
+        self.equity = self.cash + position_value
         self.peak_equity = max(self.peak_equity, self.equity)
 
     def market_exposure(self, token_id: str) -> float:

@@ -21,6 +21,8 @@ class RiskManager:
         self.kelly_fraction = float(risk.get("kelly_fraction", 0.5))
         self.min_confidence = float(risk.get("min_confidence", 0.3))
         self.max_orders_per_loop = int(config.get("max_orders_per_loop", 20))
+        self.cash_reserve_pct = float(risk.get("cash_reserve_pct", 0.30))
+        self.max_positions = int(risk.get("max_positions", 5))
 
         live = config.get("live", {})
         self.mode = str(config.get("mode", "paper")).lower()
@@ -31,6 +33,9 @@ class RiskManager:
             float(live.get("exchange_min_order_usd", 1.0)),
         )
         self.exchange_min_shares = float(live.get("exchange_min_shares", 5))
+
+        # Live balance — updated by engine each loop before calling signals_to_intents
+        self.live_balance: float | None = None
 
     def is_halted(self, portfolio: PortfolioState) -> bool:
         return portfolio.equity <= self.initial_equity - self.daily_loss_limit
@@ -83,56 +88,111 @@ class RiskManager:
     ) -> tuple[list[OrderIntent], bool]:
         """Convert signals to risk-filtered order intents.
 
+        Money management rules (thinking like it's my own money):
+        1. Always keep cash_reserve_pct of equity as cash — never spend it all
+        2. Don't open new positions if already at max_positions — focus, don't scatter
+        3. Exits (sells) always go through — protecting capital is priority #1
+        4. Budget for buys = balance - reserve, spent across signals by confidence rank
+
         Returns (intents, halted).
         """
         if self.is_halted(portfolio):
             return [], True
 
-        # Filter and sort by confidence (highest first)
+        # Separate exits (sells from position_manager) from entries
         valid = [s for s in signals if s.type != SignalType.HOLD and s.confidence >= self.min_confidence]
         valid.sort(key=lambda s: s.confidence, reverse=True)
+
+        exits = []
+        entries = []
+        for s in valid:
+            side = s.type.value
+            is_exit = s.strategy == "position_manager" and side == "sell"
+            if is_exit:
+                exits.append(s)
+            else:
+                entries.append(s)
 
         intents: list[OrderIntent] = []
         projected_exposure: dict[str, float] = {}
 
-        for signal in valid:
-            side = signal.type.value  # "buy" or "sell"
+        # --- PHASE 1: Exits first. Always allow. Protecting capital. ---
+        for signal in exits:
+            size = signal.size
+            if size <= 0:
+                continue
+            intents.append(OrderIntent(
+                token_id=signal.token_id,
+                side="sell",
+                price=signal.price,
+                size=round(size, 4),
+                strategy=signal.strategy,
+                confidence=signal.confidence,
+                metadata=signal.metadata,
+            ))
 
-            # Side gating for live mode
+        # --- PHASE 2: Entries. Budget-aware. ---
+        # Calculate how much we can actually spend this loop
+        if self.live_balance is not None:
+            total_equity = self.live_balance + sum(
+                abs(p.size) * portfolio.last_prices.get(tid, p.avg_entry)
+                for tid, p in portfolio.positions.items() if abs(p.size) > 0.01
+            )
+            reserve = total_equity * self.cash_reserve_pct
+            buy_budget = max(0, self.live_balance - reserve)
+            LOGGER.info(
+                "资金: 余额=$%.2f 总值=$%.2f 保留=$%.2f 可用=$%.2f",
+                self.live_balance, total_equity, reserve, buy_budget,
+            )
+        else:
+            # Paper mode or balance unknown — use notional limits only
+            buy_budget = float("inf")
+
+        budget_spent = 0.0
+        current_positions = sum(
+            1 for p in portfolio.positions.values() if abs(p.size) > 0.01
+        )
+
+        for signal in entries:
+            side = signal.type.value
+
+            # Side gating
             if self.mode == "live":
                 if side == "sell" and not self.allow_sell:
                     continue
                 if self.trade_side not in (side, "both"):
                     continue
 
-            # Position manager sells use exact position size (no Kelly override)
-            is_exit = signal.strategy == "position_manager" and side == "sell"
+            # Position count limit — don't open new markets if already at max
+            if side == "buy" and signal.token_id not in portfolio.positions:
+                if current_positions >= self.max_positions:
+                    continue
 
-            # Calculate size (Kelly or raw)
-            if is_exit:
-                size = signal.size
-            else:
-                size = self.kelly_size(signal) if self.use_kelly else signal.size
+            # Size
+            size = self.kelly_size(signal) if self.use_kelly else signal.size
             if size <= 0:
                 continue
 
-            # Enforce exchange minimum shares (skip for exits — sell whatever we hold)
-            if not is_exit and self.mode == "live" and size < self.exchange_min_shares:
+            if self.mode == "live" and size < self.exchange_min_shares:
                 size = self.exchange_min_shares
 
             notional = signal.price * size
 
-            # Notional bounds (skip for exits)
-            if not is_exit and notional > self.max_order_notional:
+            if notional > self.max_order_notional:
                 size = self.max_order_notional / signal.price
                 notional = self.max_order_notional
 
-            # Re-check min shares after notional cap (skip for exits)
-            if not is_exit and self.mode == "live" and size < self.exchange_min_shares:
+            if self.mode == "live" and size < self.exchange_min_shares:
                 continue
 
-            if not is_exit and self.mode == "live" and notional < self.min_order_usd:
+            if self.mode == "live" and notional < self.min_order_usd:
                 continue
+
+            # Budget check for buys
+            if side == "buy":
+                if budget_spent + notional > buy_budget:
+                    LOGGER.debug("预算不足，跳过: need=$%.2f left=$%.2f", notional, buy_budget - budget_spent)
+                    continue
 
             # Market exposure check
             current_exp = projected_exposure.get(
@@ -142,19 +202,24 @@ class RiskManager:
                 continue
 
             projected_exposure[signal.token_id] = current_exp + notional
-            intents.append(
-                OrderIntent(
-                    token_id=signal.token_id,
-                    side=side,
-                    price=signal.price,
-                    size=round(size, 4),
-                    strategy=signal.strategy,
-                    confidence=signal.confidence,
-                    metadata=signal.metadata,
-                )
-            )
+
+            if side == "buy":
+                budget_spent += notional
+
+            intents.append(OrderIntent(
+                token_id=signal.token_id,
+                side=side,
+                price=signal.price,
+                size=round(size, 4),
+                strategy=signal.strategy,
+                confidence=signal.confidence,
+                metadata=signal.metadata,
+            ))
 
             if len(intents) >= self.max_orders_per_loop:
                 break
+
+        if budget_spent > 0:
+            LOGGER.info("本轮计划花费: $%.2f / $%.2f", budget_spent, buy_budget)
 
         return intents, False
