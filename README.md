@@ -1,90 +1,90 @@
-# polymarket-mm-bot (MVP)
+# Polymarket Multi-Strategy Trading Engine
 
-当前版本支持 `paper/live` 双模式：
+4 strategies, Kelly sizing, multi-signal aggregation.
 
-- `paper`: 本地模拟成交，不会真实下单。
-- `live`: 使用官方 Python SDK (`py-clob-client`) 发真实订单。
+## Architecture
 
-## 一键安装与运行（推荐）
+```
+Market Data (Gamma API) → [Strategies] → Signals → Risk Manager → Executor (Paper/Live)
+```
+
+**Strategies:**
+- `market_making` — spread-based quoting with inventory skew
+- `arbitrage` — YES+NO mispricing detection
+- `momentum` — price trend + volume + orderbook imbalance
+- `mean_reversion` — z-score deviation from rolling mean
+
+**Risk:** Kelly criterion sizing, drawdown guard, per-market exposure limit, daily loss halt.
+
+## Setup
 
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-
-# 默认 paper
-python bot.py run --once
-python bot.py report
 ```
 
-## Live 最小运行
-
-先改配置：`config.yaml` 里 `mode: live`
-
-再设置凭证（支持 `.env` 自动加载）：
+## Run
 
 ```bash
-# 方式1：直接 export
-export POLYMARKET_PRIVATE_KEY='0x...'
-export POLYMARKET_FUNDER='0x...'
+# Paper mode
+python main.py run --once
 
-# 方式2：写入 .env（推荐）
-cat > .env <<'EOF'
+# Continuous paper
+python main.py run --interval 2
+
+# Live mode (real orders!)
+python main.py run --once --confirm-live
+
+# Report
+python main.py report
+
+# Watch events
+python main.py watch --follow --tail 30
+```
+
+## Config
+
+All settings in `config.yaml`. Key sections:
+
+- `mode`: `paper` or `live`
+- `strategies.*`: enable/disable and tune each strategy
+- `risk.*`: Kelly, drawdown, exposure limits
+- `live.*`: CLOB credentials, order type, safeguards
+
+## Credentials (.env)
+
+```
 POLYMARKET_PRIVATE_KEY=0x...
 POLYMARKET_FUNDER=0x...
-EOF
-
-python bot.py run --once --confirm-live
 ```
 
-注意：`live` 会真实下单。现在必须显式加 `--confirm-live` 才会放行。建议先小 `order_size`、`--once`、`FOK`。
-
-## CLI
+## Kill Switch
 
 ```bash
-python bot.py run --once
-python bot.py run --interval 2
-python bot.py report
-python bot.py watch --tail 30
-python bot.py watch --follow --interval 2
+touch .halt    # stops bot on next loop
+rm .halt       # re-enable
 ```
 
-## 紧急停止
+## File Structure
 
-创建 `kill_switch_file`（默认 `.halt`）即可让运行中的 loop 在下一轮自动停机：
-
-```bash
-touch .halt
 ```
-
-## 记录文件
-
-统一写 `settlement.jsonl`，常见事件：
-
-- `tick`
-- `order_open`
-- `fill`（paper）
-- `position_snapshot`
-- `equity_snapshot`
-- `halt`
-- `live_order_result` / `live_order_error`
-
-## 配置说明（`config.yaml`）
-
-- `mode`: `paper` 或 `live`
-- `top_n / min_liquidity / min_spread / order_size / order_edge`
-- `min_minutes_to_expiry / max_orders_per_loop / kill_switch_file`
-- `risk.max_order_notional / risk.max_market_exposure / risk.daily_loss_limit`
-- `live.host / live.chain_id / live.signature_type / live.private_key_env / live.funder_env / live.order_type`
-- `live.min_order_usd`（live 最小下单金额过滤，默认 1.0）
-- `live.exchange_min_order_usd`（交易所硬门槛，默认 1.0）
-- `live.allow_sell`（默认 `false`，避免无持仓/无 allowance 的卖单报错）
-- `live.trade_side`：`buy/sell/both`（默认 `buy`）
-- `live.marketable_buffer`：FOK 下单价格缓冲（默认 0）
-- `live.sync_existing_positions`：启动时从账户历史交易同步已有仓位（默认 `true`）
-
-## 文档
-
-- `docs/ARCHITECTURE_AND_DECISIONS.md`
-- `docs/HANDOFF.md`
-- `REFACTOR_MVP_SPEC.md`
+main.py              # CLI entry
+config.yaml          # Configuration
+core/
+  engine.py          # Main loop orchestration
+  models.py          # Data structures
+  config.py          # Config loading
+  events.py          # Settlement logging
+  risk.py            # Kelly sizing + risk gates
+strategies/
+  base.py            # Strategy interface
+  market_making.py   # Spread quoting
+  arbitrage.py       # Price inefficiency
+  momentum.py        # Trend following
+  mean_reversion.py  # Statistical reversion
+services/
+  gamma.py           # Market data API
+  clob.py            # Order execution
+  websocket.py       # Real-time feed (optional)
+```

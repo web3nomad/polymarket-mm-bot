@@ -5,20 +5,43 @@ run_interval_sec: 2
 top_n: 10
 min_liquidity: 1000
 min_spread: 0.02
-order_size: 10
-order_edge: 0.005
-settlement_file: "settlement.jsonl"
-request_timeout_sec: 8
-fetch_limit: 200
 min_minutes_to_expiry: 30
+fetch_limit: 200
+request_timeout_sec: 8
 max_orders_per_loop: 20
 kill_switch_file: ".halt"
+settlement_file: "settlement.jsonl"
 
 risk:
-  initial_equity: 1000
-  max_order_notional: 20
-  max_market_exposure: 100
-  daily_loss_limit: 50
+  initial_equity: 10
+  max_order_notional: 2
+  max_market_exposure: 5
+  daily_loss_limit: 3
+  use_kelly: true
+  kelly_fraction: 0.5
+  min_confidence: 0.3
+
+strategies:
+  market_making:
+    enabled: true
+    min_spread: 0.02
+    edge: 0.005
+    order_size: 10
+  arbitrage:
+    enabled: true
+    threshold: 0.02
+    order_size: 50
+  momentum:
+    enabled: true
+    lookback_trades: 20
+    buy_threshold: 0.3
+    sell_threshold: -0.3
+    order_size: 20
+  mean_reversion:
+    enabled: false
+    lookback_trades: 50
+    std_threshold: 2.0
+    order_size: 20
 
 live:
   host: "https://clob.polymarket.com"
@@ -26,13 +49,13 @@ live:
   signature_type: 1
   private_key_env: "POLYMARKET_PRIVATE_KEY"
   funder_env: "POLYMARKET_FUNDER"
-  order_type: "FOK"
-  min_order_usd: 0.1
+  order_type: "GTC"
+  min_order_usd: 1.0
   exchange_min_order_usd: 1.0
   allow_sell: false
   trade_side: "buy"
   marketable_buffer: 0.0
-  min_spread: 0.001
-  max_cross_spread: 0.0005
   sync_existing_positions: true
   sync_trade_pages: 3
+  precheck_required: true
+  market_cooldown_sec: 45
