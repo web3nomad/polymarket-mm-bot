@@ -21,11 +21,19 @@ python bot.py report
 
 先改配置：`config.yaml` 里 `mode: live`
 
-再设置凭证：
+再设置凭证（支持 `.env` 自动加载）：
 
 ```bash
+# 方式1：直接 export
 export POLYMARKET_PRIVATE_KEY='0x...'
 export POLYMARKET_FUNDER='0x...'
+
+# 方式2：写入 .env（推荐）
+cat > .env <<'EOF'
+POLYMARKET_PRIVATE_KEY=0x...
+POLYMARKET_FUNDER=0x...
+EOF
+
 python bot.py run --once --confirm-live
 ```
 

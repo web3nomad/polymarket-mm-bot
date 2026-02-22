@@ -16,6 +16,7 @@ try:
 except Exception:  # pragma: no cover
     requests = None
 import yaml
+from dotenv import load_dotenv
 
 LOGGER = logging.getLogger("polymarket_mvp")
 
@@ -724,6 +725,7 @@ def main() -> int:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    load_dotenv()
     config = load_config(args.config)
 
     if args.cmd == "run":
