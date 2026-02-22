@@ -19,6 +19,7 @@ from strategies.copy_trading import CopyTradingStrategy
 from strategies.market_making import MarketMakingStrategy
 from strategies.mean_reversion import MeanReversionStrategy
 from strategies.momentum import MomentumStrategy
+from strategies.narrative_driven import NarrativeDrivenStrategy
 from strategies.position_manager import PositionManagerStrategy
 
 LOGGER = logging.getLogger("polymarket.engine")
@@ -34,6 +35,7 @@ def _build_strategies(config: dict[str, Any]) -> list[BaseStrategy]:
         ("arbitrage", ArbitrageStrategy),
         ("momentum", MomentumStrategy),
         ("mean_reversion", MeanReversionStrategy),
+        ("narrative_driven", NarrativeDrivenStrategy),
     ]
     active: list[BaseStrategy] = []
     for name, cls in registry:

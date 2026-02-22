@@ -59,6 +59,16 @@ strategies:
     take_profit_pct: 0.05
     stop_loss_pct: 0.08
     min_position_size: 1.0
+  narrative_driven:
+    enabled: true
+    keywords: [inflation, CPI, Fed, rate cut, unemployment, GDP]
+    refresh_markets_sec: 600
+    refresh_tweets_sec: 120
+    min_tweet_count: 3
+    min_sentiment_score: 0.3
+    order_size: 5
+    manual_confirm: false
+    twitter_token_env: "X_BEARER_TOKEN"
 
 live:
   host: "https://clob.polymarket.com"
