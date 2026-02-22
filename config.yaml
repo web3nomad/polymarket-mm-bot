@@ -1,7 +1,7 @@
 mode: live
 
 gamma_url: "https://gamma-api.polymarket.com/markets"
-run_interval_sec: 2
+run_interval_sec: 5
 top_n: 20
 min_liquidity: 500
 min_spread: 0.005
@@ -42,6 +42,11 @@ strategies:
     lookback_trades: 50
     std_threshold: 2.0
     order_size: 20
+  position_manager:
+    enabled: true
+    take_profit_pct: 0.05
+    stop_loss_pct: 0.08
+    min_position_size: 1.0
 
 live:
   host: "https://clob.polymarket.com"
@@ -53,8 +58,8 @@ live:
   min_order_usd: 1.0
   exchange_min_order_usd: 1.0
   exchange_min_shares: 5
-  allow_sell: false
-  trade_side: "buy"
+  allow_sell: true
+  trade_side: "both"
   marketable_buffer: 0.0
   sync_existing_positions: true
   sync_trade_pages: 3

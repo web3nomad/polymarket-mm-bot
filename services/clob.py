@@ -156,6 +156,21 @@ def execute_paper(
     return fills
 
 
+def cancel_stale_orders(client: Any, intents: list[OrderIntent]) -> int:
+    """Cancel existing open orders for tokens we're about to re-quote."""
+    token_ids = {i.token_id for i in intents}
+    cancelled = 0
+    for token_id in token_ids:
+        try:
+            client.cancel_market_orders(asset_id=str(token_id))
+            cancelled += 1
+        except Exception as exc:
+            LOGGER.debug("Cancel orders for %s: %s", token_id[:12], exc)
+    if cancelled:
+        LOGGER.info("Cancelled open orders for %d markets", cancelled)
+    return cancelled
+
+
 def execute_live(
     intents: list[OrderIntent],
     client: Any,
@@ -169,9 +184,16 @@ def execute_live(
 
     live_cfg = config.get("live", {})
     order_type = _normalize_order_type(str(live_cfg.get("order_type", "GTC")))
-    precheck_required = bool(live_cfg.get("precheck_required", True))
     cooldown_sec = float(live_cfg.get("market_cooldown_sec", 45))
     posted = 0
+
+    # Cancel existing orders for tokens we're about to re-quote
+    cancel_stale_orders(client, intents)
+
+    # Get available balance ONCE, then budget across all orders
+    available = get_usdc_balance(client)
+    spent = 0.0
+    LOGGER.info("Loop budget: $%.2f available", available)
 
     for intent in intents:
         now = time.time()
@@ -186,21 +208,17 @@ def execute_live(
             })
             continue
 
-        # Precheck balance
-        ok, status, details = _precheck(client, intent)
-        if not ok:
-            if status == "probe_unavailable" and not precheck_required:
-                pass  # Allow through
-            else:
-                LOGGER.warning("Precheck failed: token=%s status=%s", intent.token_id, status)
+        # Budget check: buy orders cost money, sell orders don't
+        if intent.side == "buy":
+            cost = intent.price * intent.size
+            if spent + cost > available:
                 write_event(settlement, {
-                    "type": "live_precheck_skip",
+                    "type": "live_order_skip",
                     "token_id": intent.token_id,
                     "side": intent.side,
-                    "status": status,
-                    "details": details,
+                    "reason": "budget_exhausted",
+                    "details": {"cost": round(cost, 2), "spent": round(spent, 2), "available": round(available, 2)},
                 })
-                cooldowns[intent.token_id] = now + cooldown_sec
                 continue
 
         write_event(settlement, {
@@ -223,6 +241,8 @@ def execute_live(
             ))
             resp = client.post_order(signed_order, order_type)
             posted += 1
+            if intent.side == "buy":
+                spent += intent.price * intent.size
 
             write_event(settlement, {
                 "type": "live_order_result",
@@ -248,6 +268,21 @@ def execute_live(
                     "price": round(intent.price, 6),
                     "size": intent.size,
                     "strategy": intent.strategy,
+                })
+            elif success:
+                # GTC order accepted but not immediately matched —
+                # count as pending exposure so next loop won't double up
+                pos = portfolio.positions.setdefault(intent.token_id, Position())
+                pos.apply_fill(intent.side, intent.price, intent.size)
+                write_event(settlement, {
+                    "type": "pending_order",
+                    "exec_mode": "live",
+                    "token_id": intent.token_id,
+                    "side": intent.side,
+                    "price": round(intent.price, 6),
+                    "size": intent.size,
+                    "strategy": intent.strategy,
+                    "status": status,
                 })
             elif not success or status in ("killed", "cancelled", "rejected"):
                 error_class = _classify_error(response=resp)

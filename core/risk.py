@@ -105,27 +105,33 @@ class RiskManager:
                 if self.trade_side not in (side, "both"):
                     continue
 
+            # Position manager sells use exact position size (no Kelly override)
+            is_exit = signal.strategy == "position_manager" and side == "sell"
+
             # Calculate size (Kelly or raw)
-            size = self.kelly_size(signal) if self.use_kelly else signal.size
+            if is_exit:
+                size = signal.size
+            else:
+                size = self.kelly_size(signal) if self.use_kelly else signal.size
             if size <= 0:
                 continue
 
-            # Enforce exchange minimum shares
-            if self.mode == "live" and size < self.exchange_min_shares:
+            # Enforce exchange minimum shares (skip for exits — sell whatever we hold)
+            if not is_exit and self.mode == "live" and size < self.exchange_min_shares:
                 size = self.exchange_min_shares
 
             notional = signal.price * size
 
-            # Notional bounds
-            if notional > self.max_order_notional:
+            # Notional bounds (skip for exits)
+            if not is_exit and notional > self.max_order_notional:
                 size = self.max_order_notional / signal.price
                 notional = self.max_order_notional
 
-            # Re-check min shares after notional cap
-            if self.mode == "live" and size < self.exchange_min_shares:
+            # Re-check min shares after notional cap (skip for exits)
+            if not is_exit and self.mode == "live" and size < self.exchange_min_shares:
                 continue
 
-            if self.mode == "live" and notional < self.min_order_usd:
+            if not is_exit and self.mode == "live" and notional < self.min_order_usd:
                 continue
 
             # Market exposure check

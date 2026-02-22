@@ -29,7 +29,7 @@ class MarketMakingStrategy(BaseStrategy):
             confidence = min(m.spread / max(self.edge * 4, 0.01), 1.0)
 
             buy_price = max(0.01, min(0.99, m.best_bid + self.edge))
-            sell_price = max(0.01, min(0.99, m.best_ask - self.edge))
+            sell_price = max(m.best_bid + 0.01, min(0.99, m.best_ask - self.edge))
 
             # Inventory skew: if we're long, favor selling; if short, favor buying
             pos = portfolio.positions.get(m.token_id)
@@ -40,6 +40,7 @@ class MarketMakingStrategy(BaseStrategy):
                 buy_confidence = max(0, confidence * (1 - skew * 2))
                 sell_confidence = max(0, confidence * (1 + skew * 2))
 
+            # Buy side: always quote
             signals.append(Signal(
                 type=SignalType.BUY,
                 token_id=m.token_id,
@@ -49,14 +50,18 @@ class MarketMakingStrategy(BaseStrategy):
                 strategy=self.name,
                 metadata={"spread": round(m.spread, 4), "edge": self.edge},
             ))
-            signals.append(Signal(
-                type=SignalType.SELL,
-                token_id=m.token_id,
-                price=sell_price,
-                size=self.order_size,
-                confidence=sell_confidence,
-                strategy=self.name,
-                metadata={"spread": round(m.spread, 4), "edge": self.edge},
-            ))
+
+            # Sell side: only if we have inventory to sell
+            if pos and pos.size >= 1.0:
+                sell_size = min(self.order_size, pos.size)
+                signals.append(Signal(
+                    type=SignalType.SELL,
+                    token_id=m.token_id,
+                    price=sell_price,
+                    size=sell_size,
+                    confidence=sell_confidence,
+                    strategy=self.name,
+                    metadata={"spread": round(m.spread, 4), "edge": self.edge},
+                ))
 
         return signals

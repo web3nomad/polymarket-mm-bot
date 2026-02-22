@@ -18,6 +18,7 @@ from strategies.base import BaseStrategy
 from strategies.market_making import MarketMakingStrategy
 from strategies.mean_reversion import MeanReversionStrategy
 from strategies.momentum import MomentumStrategy
+from strategies.position_manager import PositionManagerStrategy
 
 LOGGER = logging.getLogger("polymarket.engine")
 
@@ -30,6 +31,7 @@ def _build_strategies(config: dict[str, Any]) -> list[BaseStrategy]:
         ("arbitrage", ArbitrageStrategy),
         ("momentum", MomentumStrategy),
         ("mean_reversion", MeanReversionStrategy),
+        ("position_manager", PositionManagerStrategy),
     ]
     active: list[BaseStrategy] = []
     for name, cls in registry:
@@ -134,7 +136,8 @@ def run_loop(config: dict[str, Any], once: bool, interval: float | None, confirm
             write_event(settlement, {"type": "halt", "reason": "live_client_init_failed", "error": str(exc)})
             return 1
 
-    positions_synced = False
+    last_position_sync = 0.0
+    position_sync_interval = 30.0  # Re-sync positions every 30s
     cooldowns: dict[str, float] = {}
     sleep_sec = float(interval if interval is not None else config.get("run_interval_sec", 2.0))
     kill_switch = Path(str(config.get("kill_switch_file", ".halt")))
@@ -167,14 +170,15 @@ def run_loop(config: dict[str, Any], once: bool, interval: float | None, confirm
                 time.sleep(sleep_sec)
                 continue
 
-            # Sync live positions once
-            if mode == "live" and not positions_synced and config.get("live", {}).get("sync_existing_positions", True):
+            # Sync live positions periodically
+            now = time.time()
+            if mode == "live" and now - last_position_sync >= position_sync_interval and config.get("live", {}).get("sync_existing_positions", True):
                 try:
                     synced = sync_positions(live_client, config, markets)
                     for token_id, pos in synced.items():
                         if abs(pos.size) > 1e-12:
                             portfolio.positions[token_id] = pos
-                    positions_synced = True
+                    last_position_sync = now
                     write_event(settlement, {
                         "type": "position_sync",
                         "exec_mode": "live",
@@ -182,7 +186,7 @@ def run_loop(config: dict[str, Any], once: bool, interval: float | None, confirm
                     })
                 except Exception as exc:
                     LOGGER.warning("Position sync failed: %s", exc)
-                    positions_synced = True  # Don't retry forever
+                    last_position_sync = now  # Don't retry immediately
 
             # Update prices
             for m in markets:
