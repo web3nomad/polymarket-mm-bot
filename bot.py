@@ -55,6 +55,8 @@ DEFAULT_CONFIG = {
     "run_interval_sec": 2.0,
     "top_n": 5,
     "min_liquidity": 1000.0,
+    "min_best_ask": 0.03,
+    "max_best_ask": 0.97,
     "min_spread": 0.02,
     "order_size": 10.0,
     "order_edge": 0.005,
@@ -72,7 +74,14 @@ DEFAULT_CONFIG = {
         "funder_env": "POLYMARKET_FUNDER",
         "order_type": "FOK",
         "min_order_usd": 1.0,
+        "exchange_min_order_usd": 1.0,
         "allow_sell": False,
+        "trade_side": "buy",
+        "marketable_buffer": 0.0,
+        "min_spread": 0.005,
+        "max_cross_spread": 0.0005,
+        "sync_existing_positions": True,
+        "sync_trade_pages": 3,
     },
     "settlement_file": "settlement.jsonl",
     "request_timeout_sec": 8,
@@ -298,12 +307,16 @@ def fetch_markets(config: dict[str, Any]) -> list[Market]:
 
     markets: list[Market] = []
     min_liquidity = float(config.get("min_liquidity", 0))
+    min_best_ask = float(config.get("min_best_ask", 0.0))
+    max_best_ask = float(config.get("max_best_ask", 1.0))
     min_minutes_to_expiry = float(config.get("min_minutes_to_expiry", 0))
     for row in rows:
         parsed = _parse_market(row)
         if not parsed:
             continue
         if parsed.liquidity < min_liquidity:
+            continue
+        if parsed.best_ask < min_best_ask or parsed.best_ask > max_best_ask:
             continue
         if (
             parsed.minutes_to_expiry is not None
@@ -318,35 +331,76 @@ def fetch_markets(config: dict[str, Any]) -> list[Market]:
 
 def build_intents(markets: list[Market], config: dict[str, Any]) -> list[OrderIntent]:
     intents: list[OrderIntent] = []
-    min_spread = float(config.get("min_spread", 0.02))
     order_size = float(config.get("order_size", 10.0))
     edge = float(config.get("order_edge", 0.005))
+
+    mode = str(config.get("mode", "paper")).lower().strip()
+    live_cfg = config.get("live", {})
+    min_spread = float(config.get("min_spread", 0.02))
+    if mode == "live":
+        min_spread = float(live_cfg.get("min_spread", min_spread))
+    risk_cfg = config.get("risk", {})
+    max_order_notional = float(risk_cfg.get("max_order_notional", 0))
+    live_min_order_usd = float(live_cfg.get("min_order_usd", 0.0))
+    exchange_min_order_usd = float(live_cfg.get("exchange_min_order_usd", 1.0))
+    live_target_notional = (
+        max(live_min_order_usd, exchange_min_order_usd) if mode == "live" else 0.0
+    )
+    live_side = str(live_cfg.get("trade_side", "buy")).lower().strip()
+    order_type = str(live_cfg.get("order_type", "FOK")).upper().strip()
+    marketable_buffer = float(live_cfg.get("marketable_buffer", 0.0))
+    max_cross_spread = float(live_cfg.get("max_cross_spread", 1.0))
 
     for m in markets:
         spread = m.best_ask - m.best_bid
         if spread < min_spread:
             continue
+        if mode == "live" and spread > max_cross_spread:
+            continue
 
-        buy_price = max(0.0, min(1.0, m.best_bid + edge))
-        sell_price = max(0.0, min(1.0, m.best_ask - edge))
-        intents.append(
-            OrderIntent(
-                market_id=m.market_id,
-                side="buy",
-                price=buy_price,
-                size=order_size,
-                token_id=m.token_id,
+        # For live FOK/GTD taker style, use marketable price to increase fill probability.
+        if mode == "live" and order_type in {"FOK"}:
+            buy_price = max(0.0, min(1.0, m.best_ask + marketable_buffer))
+            sell_price = max(0.0, min(1.0, m.best_bid - marketable_buffer))
+        else:
+            buy_price = max(0.0, min(1.0, m.best_bid + edge))
+            sell_price = max(0.0, min(1.0, m.best_ask - edge))
+
+        def sized(base_size: float, px: float) -> float:
+            if live_target_notional <= 0:
+                return base_size
+            if px <= 0:
+                return base_size
+            needed = live_target_notional / px
+            return max(base_size, needed)
+
+        buy_size = sized(order_size, buy_price)
+        sell_size = sized(order_size, sell_price)
+        if max_order_notional > 0 and buy_price * buy_size > max_order_notional:
+            buy_size = 0.0
+        if max_order_notional > 0 and sell_price * sell_size > max_order_notional:
+            sell_size = 0.0
+
+        if live_side in {"buy", "both"} and buy_size > 0:
+            intents.append(
+                OrderIntent(
+                    market_id=m.market_id,
+                    side="buy",
+                    price=buy_price,
+                    size=buy_size,
+                    token_id=m.token_id,
+                )
             )
-        )
-        intents.append(
-            OrderIntent(
-                market_id=m.market_id,
-                side="sell",
-                price=sell_price,
-                size=order_size,
-                token_id=m.token_id,
+        if live_side in {"sell", "both"} and sell_size > 0:
+            intents.append(
+                OrderIntent(
+                    market_id=m.market_id,
+                    side="sell",
+                    price=sell_price,
+                    size=sell_size,
+                    token_id=m.token_id,
+                )
             )
-        )
     return intents
 
 
@@ -365,12 +419,20 @@ def risk_filter(
     max_market_exposure = float(risk["max_market_exposure"])
     max_orders_per_loop = int(cfg.get("max_orders_per_loop", 999999))
     mode = str(cfg.get("mode", "paper")).lower().strip()
-    live_min_order_usd = (
-        float(cfg.get("live", {}).get("min_order_usd", 0.0)) if mode == "live" else 0.0
-    )
+    if mode == "live":
+        live_cfg = cfg.get("live", {})
+        live_min_order_usd = max(
+            float(live_cfg.get("min_order_usd", 0.0)),
+            float(live_cfg.get("exchange_min_order_usd", 1.0)),
+        )
+    else:
+        live_min_order_usd = 0.0
+    live_allow_sell = bool(cfg.get("live", {}).get("allow_sell", False))
 
     projected_exposure: dict[str, float] = {}
     for intent in intents:
+        if mode == "live" and intent.side == "sell" and not live_allow_sell:
+            continue
         notional = intent.price * intent.size
         if notional > max_order_notional:
             continue
@@ -471,6 +533,73 @@ def _side_constant(side: str) -> Any:
     return BUY if side == "buy" else SELL
 
 
+def _apply_fill_to_position(pos: Position, side: str, price: float, size: float) -> None:
+    signed = size if side == "buy" else -size
+    if pos.size == 0:
+        pos.size = signed
+        pos.avg_entry = price
+        return
+
+    if (pos.size > 0 and signed > 0) or (pos.size < 0 and signed < 0):
+        total_abs = abs(pos.size) + abs(signed)
+        pos.avg_entry = ((abs(pos.size) * pos.avg_entry) + (abs(signed) * price)) / max(total_abs, 1e-12)
+        pos.size += signed
+        return
+
+    closing_qty = min(abs(pos.size), abs(signed))
+    realized = (price - pos.avg_entry) * closing_qty if pos.size > 0 else (pos.avg_entry - price) * closing_qty
+    remaining = pos.size + signed
+    pos.realized_pnl += realized
+    if remaining == 0:
+        pos.size = 0.0
+        pos.avg_entry = 0.0
+    elif abs(signed) > abs(pos.size):
+        pos.size = remaining
+        pos.avg_entry = price
+    else:
+        pos.size = remaining
+
+
+def sync_positions_from_live_trades(client: Any, config: dict[str, Any], markets: list[Market]) -> dict[str, Position]:
+    from py_clob_client.clob_types import TradeParams
+
+    live_cfg = config.get("live", {})
+    pages = max(1, int(live_cfg.get("sync_trade_pages", 3)))
+    token_to_market = {m.token_id: m.market_id for m in markets if m.token_id}
+
+    all_trades: list[dict[str, Any]] = []
+    next_cursor = "MA=="
+    for _ in range(pages):
+        resp = client.get_trades(TradeParams(), next_cursor=next_cursor)
+        if not isinstance(resp, list) or not resp:
+            break
+        all_trades.extend([x for x in resp if isinstance(x, dict)])
+        # py-clob-client currently returns list; stop to avoid looping same page.
+        break
+
+    all_trades.sort(key=lambda x: int(str(x.get("match_time", "0")) or "0"))
+
+    out: dict[str, Position] = {}
+    for tr in all_trades:
+        if str(tr.get("status", "")).upper() != "CONFIRMED":
+            continue
+        token_id = str(tr.get("asset_id") or "").strip()
+        if not token_id:
+            continue
+        market_id = token_to_market.get(token_id) or f"token:{token_id[:16]}"
+        side_raw = str(tr.get("side", "")).upper()
+        side = "buy" if side_raw == "BUY" else "sell" if side_raw == "SELL" else ""
+        if not side:
+            continue
+        size = _to_float(tr.get("size"))
+        price = _to_float(tr.get("price"))
+        if not size or not price:
+            continue
+        pos = out.setdefault(market_id, Position())
+        _apply_fill_to_position(pos, side, float(price), float(size))
+    return out
+
+
 def create_live_client(config: dict[str, Any]) -> Any:
     live = config.get("live", {})
     private_key = os.getenv(
@@ -508,7 +637,11 @@ def create_live_client(config: dict[str, Any]) -> Any:
 
 
 def execute_live(
-    intents: list[OrderIntent], client: Any, config: dict[str, Any], settlement: Path
+    intents: list[OrderIntent],
+    client: Any,
+    config: dict[str, Any],
+    settlement: Path,
+    engine: PaperEngine,
 ) -> int:
     from py_clob_client.clob_types import OrderArgs
 
@@ -564,6 +697,20 @@ def execute_live(
                     "result": resp,
                 },
             )
+            if bool(resp.get("success")) and str(resp.get("status", "")).lower() == "matched":
+                engine.apply_fill(intent.market_id, intent.side, float(intent.price), float(intent.size))
+                write_event(
+                    settlement,
+                    {
+                        "type": "fill",
+                        "exec_mode": "live",
+                        "market_id": intent.market_id,
+                        "token_id": intent.token_id,
+                        "side": intent.side,
+                        "price": round(intent.price, 6),
+                        "size": intent.size,
+                    },
+                )
         except Exception as exc:
             LOGGER.warning(
                 "Live order failed market=%s side=%s err=%s",
@@ -604,107 +751,138 @@ def run_loop(
 
     engine = PaperEngine(initial_equity=float(config["risk"]["initial_equity"]))
     live_client = create_live_client(config) if mode == "live" else None
+    live_positions_synced = False
     sleep_sec = float(
         interval if interval is not None else config.get("run_interval_sec", 2.0)
     )
 
     kill_switch = Path(str(config.get("kill_switch_file", ".halt")))
 
-    while True:
-        if kill_switch.exists():
-            write_event(
-                settlement, {"type": "halt", "reason": f"kill_switch:{kill_switch}"}
-            )
-            LOGGER.warning("Kill switch detected (%s). Stopping loop.", kill_switch)
-            return 0
-        try:
-            markets = fetch_markets(config)
-        except Exception as exc:
-            LOGGER.warning("Failed to fetch market data: %s", exc)
-            if once:
+    try:
+        while True:
+            if kill_switch.exists():
+                write_event(
+                    settlement, {"type": "halt", "reason": f"kill_switch:{kill_switch}"}
+                )
+                LOGGER.warning("Kill switch detected (%s). Stopping loop.", kill_switch)
                 return 0
-            time.sleep(max(0.1, sleep_sec))
-            continue
+            try:
+                markets = fetch_markets(config)
+            except Exception as exc:
+                LOGGER.warning("Failed to fetch market data: %s", exc)
+                if once:
+                    return 0
+                time.sleep(max(0.1, sleep_sec))
+                continue
 
-        if not markets:
-            LOGGER.warning("No markets available after filtering.")
-            if once:
+            if not markets:
+                LOGGER.warning("No markets available after filtering.")
+                if once:
+                    return 0
+                time.sleep(max(0.1, sleep_sec))
+                continue
+
+            if mode == "live" and not live_positions_synced and bool(config.get("live", {}).get("sync_existing_positions", True)):
+                synced = sync_positions_from_live_trades(live_client, config, markets)
+                for market_id, pos in synced.items():
+                    if abs(pos.size) > 1e-12:
+                        engine.positions[market_id] = pos
+                live_positions_synced = True
+                write_event(
+                    settlement,
+                    {
+                        "type": "position_sync",
+                        "exec_mode": "live",
+                        "synced_markets": len([1 for p in synced.values() if abs(p.size) > 1e-12]),
+                    },
+                )
+
+            engine.update_marks(markets)
+            for m in markets:
+                write_event(
+                    settlement,
+                    {
+                        "type": "tick",
+                        "market_id": m.market_id,
+                        "question": m.question,
+                        "best_bid": m.best_bid,
+                        "best_ask": m.best_ask,
+                        "liquidity": m.liquidity,
+                        "end_time": m.end_time,
+                        "token_id": m.token_id,
+                    },
+                )
+
+            intents = build_intents(markets, config)
+            allowed, halted = risk_filter(intents, engine, config)
+            if halted:
+                write_event(settlement, {"type": "halt", "reason": "daily_loss_limit"})
+                LOGGER.warning("Daily loss halt triggered. Stop opening new orders.")
                 return 0
-            time.sleep(max(0.1, sleep_sec))
-            continue
-
-        engine.update_marks(markets)
-        for m in markets:
-            write_event(
-                settlement,
-                {
-                    "type": "tick",
-                    "market_id": m.market_id,
-                    "question": m.question,
-                    "best_bid": m.best_bid,
-                    "best_ask": m.best_ask,
-                    "liquidity": m.liquidity,
-                    "end_time": m.end_time,
-                    "token_id": m.token_id,
-                },
-            )
-
-        intents = build_intents(markets, config)
-        allowed, halted = risk_filter(intents, engine, config)
-        if halted:
-            write_event(settlement, {"type": "halt", "reason": "daily_loss_limit"})
-            LOGGER.warning("Daily loss halt triggered. Stop opening new orders.")
-            return 0
 
         if mode == "paper":
             executed = execute_paper(allowed, markets, engine, settlement)
         else:
-            executed = execute_live(allowed, live_client, config, settlement)
+            executed = execute_live(allowed, live_client, config, settlement, engine)
 
-        position_rows = []
-        for market_id, pos in engine.positions.items():
-            if abs(pos.size) < 1e-12:
-                continue
-            position_rows.append(
+            position_rows = []
+            for market_id, pos in engine.positions.items():
+                if abs(pos.size) < 1e-12:
+                    continue
+                position_rows.append(
+                    {
+                        "market_id": market_id,
+                        "size": round(pos.size, 6),
+                        "avg_entry": round(pos.avg_entry, 6),
+                        "realized_pnl": round(pos.realized_pnl, 6),
+                    }
+                )
+
+            write_event(
+                settlement, {"type": "position_snapshot", "positions": position_rows}
+            )
+            write_event(
+                settlement,
                 {
-                    "market_id": market_id,
-                    "size": round(pos.size, 6),
-                    "avg_entry": round(pos.avg_entry, 6),
-                    "realized_pnl": round(pos.realized_pnl, 6),
-                }
+                    "type": "equity_snapshot",
+                    "equity": round(engine.equity(), 6) if mode == "paper" else None,
+                    "realized_pnl": round(engine.realized_total(), 6)
+                    if mode == "paper"
+                    else None,
+                    "unrealized_pnl": round(engine.unrealized_total(), 6)
+                    if mode == "paper"
+                    else None,
+                    "halted": False,
+                    "exec_mode": mode,
+                },
+            )
+            write_event(
+                settlement,
+                {
+                    "type": "loop_summary",
+                    "exec_mode": mode,
+                    "markets": len(markets),
+                    "intents": len(intents),
+                    "allowed": len(allowed),
+                    "executed": executed,
+                },
             )
 
-        write_event(
-            settlement, {"type": "position_snapshot", "positions": position_rows}
-        )
-        write_event(
-            settlement,
-            {
-                "type": "equity_snapshot",
-                "equity": round(engine.equity(), 6) if mode == "paper" else None,
-                "realized_pnl": round(engine.realized_total(), 6)
-                if mode == "paper"
-                else None,
-                "unrealized_pnl": round(engine.unrealized_total(), 6)
-                if mode == "paper"
-                else None,
-                "halted": False,
-                "exec_mode": mode,
-            },
-        )
+            LOGGER.info(
+                "mode=%s markets=%s intents=%s allowed=%s executed=%s",
+                mode,
+                len(markets),
+                len(intents),
+                len(allowed),
+                executed,
+            )
 
-        LOGGER.info(
-            "mode=%s markets=%s intents=%s allowed=%s executed=%s",
-            mode,
-            len(markets),
-            len(intents),
-            len(allowed),
-            executed,
-        )
-
-        if once:
-            return 0
-        time.sleep(max(0.1, sleep_sec))
+            if once:
+                return 0
+            time.sleep(max(0.1, sleep_sec))
+    except KeyboardInterrupt:
+        LOGGER.info("Interrupted by user.")
+        return 0
 
 
 def _is_today_utc(ts: str) -> bool:
@@ -828,7 +1006,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("report", help="Show today's pnl/positions/halt")
+    watch_p = sub.add_parser("watch", help="Watch settlement stream summary")
+    watch_p.add_argument("--follow", action="store_true", help="Keep watching new events")
+    watch_p.add_argument("--interval", type=float, default=2.0, help="Refresh interval seconds")
+    watch_p.add_argument("--tail", type=int, default=20, help="Number of recent events to summarize")
     return parser
+
+
+def watch(config: dict[str, Any], follow: bool, interval: float, tail: int) -> int:
+    settlement = Path(config.get("settlement_file", "settlement.jsonl"))
+    if not settlement.exists():
+        print(f"settlement file not found: {settlement}")
+        return 1
+
+    def render() -> None:
+        events = _load_events(settlement)
+        recent = events[-max(1, int(tail)) :]
+        type_counts: dict[str, int] = {}
+        for e in recent:
+            t = str(e.get("type", ""))
+            type_counts[t] = type_counts.get(t, 0) + 1
+        print(
+            json.dumps(
+                {
+                    "ts": utc_now_iso(),
+                    "recent_events": len(recent),
+                    "counts": type_counts,
+                    "latest": recent[-1] if recent else None,
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    render()
+    while follow:
+        time.sleep(max(0.2, float(interval)))
+        render()
+    return 0
 
 
 def main() -> int:
@@ -850,6 +1064,13 @@ def main() -> int:
         )
     if args.cmd == "report":
         return report(config=config)
+    if args.cmd == "watch":
+        return watch(
+            config=config,
+            follow=bool(getattr(args, "follow", False)),
+            interval=float(getattr(args, "interval", 2.0)),
+            tail=int(getattr(args, "tail", 20)),
+        )
 
     parser.print_help()
     return 1

@@ -45,6 +45,8 @@ python bot.py run --once --confirm-live
 python bot.py run --once
 python bot.py run --interval 2
 python bot.py report
+python bot.py watch --tail 30
+python bot.py watch --follow --interval 2
 ```
 
 ## 紧急停止
@@ -75,7 +77,11 @@ touch .halt
 - `risk.max_order_notional / risk.max_market_exposure / risk.daily_loss_limit`
 - `live.host / live.chain_id / live.signature_type / live.private_key_env / live.funder_env / live.order_type`
 - `live.min_order_usd`（live 最小下单金额过滤，默认 1.0）
+- `live.exchange_min_order_usd`（交易所硬门槛，默认 1.0）
 - `live.allow_sell`（默认 `false`，避免无持仓/无 allowance 的卖单报错）
+- `live.trade_side`：`buy/sell/both`（默认 `buy`）
+- `live.marketable_buffer`：FOK 下单价格缓冲（默认 0）
+- `live.sync_existing_positions`：启动时从账户历史交易同步已有仓位（默认 `true`）
 
 ## 文档
 
