@@ -1,3 +1,7 @@
+# ⚠️ DEPRECATED — See DEPRECATED.md
+
+---
+
 # Polymarket Multi-Strategy Trading Engine
 
 4 strategies, Kelly sizing, multi-signal aggregation.
